@@ -7,6 +7,7 @@
 #include "fast/interpreter.h"
 #include "fast/backends/gfx_sdl.h"
 #include "fast/backends/gfx_dxgi.h"
+#include "fast/backends/gfx_deko3d.h"
 #include "fast/backends/gfx_opengl.h"
 #include "fast/backends/gfx_metal.h"
 #include "fast/backends/gfx_direct3d_common.h"
@@ -149,6 +150,12 @@ void Fast3dWindow::InitWindowManager() {
 #ifdef ENABLE_OPENGL
         case WindowBackend::FAST3D_SDL_OPENGL:
             mRenderingApi = new GfxRenderingAPIOGL();
+            mWindowManagerApi = new GfxWindowBackendSDL2();
+            break;
+#endif
+#ifdef ENABLE_DEKO3D
+        case WindowBackend::FAST3D_SDL_DEKO3D:
+            mRenderingApi = new GfxRenderingAPIDeko3D();
             mWindowManagerApi = new GfxWindowBackendSDL2();
             break;
 #endif

@@ -343,17 +343,23 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
 
     SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
 
+#if defined(__SWITCH__) && defined(ENABLE_DEKO3D)
+    constexpr bool use_deko3d = true;
+#else
+    constexpr bool use_deko3d = false;
+#endif
+
 #if defined(__APPLE__)
     bool use_opengl = strcmp(gfxApiName, "OpenGL") == 0;
 #else
-    constexpr bool use_opengl = true;
+    constexpr bool use_opengl = !use_deko3d;
 #endif
 
     if (use_opengl) {
         SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
         SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
         SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-    } else {
+    } else if (!use_deko3d) {
         SDL_SetHint(SDL_HINT_RENDER_DRIVER, "metal");
     }
 
@@ -402,7 +408,7 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
 
     if (use_opengl) {
         flags = flags | SDL_WINDOW_OPENGL;
-    } else {
+    } else if (!use_deko3d) {
         flags = flags | SDL_WINDOW_METAL;
     }
 
@@ -443,6 +449,8 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
 #endif
         window_impl.Opengl = { mWnd, mCtx };
         window_impl.Backend = WindowBackend::FAST3D_SDL_OPENGL;
+    } else if (use_deko3d) {
+        window_impl.Backend = WindowBackend::FAST3D_SDL_DEKO3D;
     } else {
         uint32_t flags = SDL_RENDERER_ACCELERATED;
         if (mVsyncEnabled) {
@@ -774,7 +782,9 @@ void GfxWindowBackendSDL2::SwapBuffersBegin() {
     }
 
     SyncFramerateWithTime();
+#if !(defined(__SWITCH__) && defined(ENABLE_DEKO3D))
     SDL_GL_SwapWindow(mWnd);
+#endif
 }
 
 void GfxWindowBackendSDL2::SwapBuffersEnd() {
