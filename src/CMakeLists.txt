@@ -326,3 +326,10 @@ if ("${CMAKE_CXX_COMPILER_ID}" MATCHES "GNU|Clang")
     endif()
 endif()
 
+
+# Experimental deko3d renderer for Nintendo Switch
+option(USE_DEKO3D "Use the deko3d rendering backend (Switch only)" OFF)
+if (USE_DEKO3D AND CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+    target_compile_definitions(libultraship PRIVATE ENABLE_DEKO3D)
+    target_link_libraries(libultraship PUBLIC deko3d)
+endif()
