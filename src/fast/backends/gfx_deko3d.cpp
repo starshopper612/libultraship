@@ -3,11 +3,30 @@
 #include <array>
 #include <switch.h>
 #include <deko3d.hpp>
+#include <cstdarg>
+#include <typeinfo>
+#include <cstdlib>
+#include <cstdio>
 
 namespace Fast {
 namespace {
 constexpr uint32_t kNumFb = 2;
 constexpr uint32_t kCmdMemSize = 0x10000;
+void DkLogF(const char* fmt, ...) {
+    FILE* f = fopen("sdmc:/deko3d.log", "a");
+    if (!f) {
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+void DkDebugCb(void*, const char* ctx, DkResult res, const char* msg) {
+    DkLogF("deko3d: %s result=%d %s", ctx ? ctx : "?", (int)res, msg ? msg : "");
+}
 struct DkState {
     dk::UniqueDevice device;
     dk::UniqueQueue queue;
@@ -44,7 +63,7 @@ void GfxRenderingAPIDeko3D::SetUseAlpha(bool) {}
 void GfxRenderingAPIDeko3D::DrawTriangles(float*, size_t, size_t) {}
 void GfxRenderingAPIDeko3D::Init() {
     auto& d = gDk;
-    d.device = dk::DeviceMaker{}.create();
+    d.device = dk::DeviceMaker{}.setCbDebug(DkDebugCb).create();
     d.queue = dk::QueueMaker{ d.device }.setFlags(DkQueueFlags_Graphics).create();
 
     dk::ImageLayout layout;
@@ -65,7 +84,11 @@ void GfxRenderingAPIDeko3D::Init() {
         d.images[i].initialize(layout, d.fbMem, i * sz);
         ptrs[i] = &d.images[i];
     }
+    DkLogF("Init: layout size=%u align=%u fb=%ux%u", sz, al, d.width, d.height);
+    nwindowSetDimensions(nwindowGetDefault(), d.width, d.height);
+    DkLogF("Init: creating swapchain");
     d.swapchain = dk::SwapchainMaker{ d.device, nwindowGetDefault(), ptrs }.create();
+    DkLogF("Init: swapchain ok");
 
     d.cmdMem = dk::MemBlockMaker{ d.device, kCmdMemSize }
                    .setFlags(DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached)
@@ -74,9 +97,20 @@ void GfxRenderingAPIDeko3D::Init() {
     d.cmdBuf.addMemory(d.cmdMem, 0, kCmdMemSize);
 }
 void GfxRenderingAPIDeko3D::OnResize() {}
-void GfxRenderingAPIDeko3D::StartFrame() {}
+void GfxRenderingAPIDeko3D::StartFrame() {
+    static uint32_t n = 0;
+    if (n < 3 || n % 600 == 0) {
+        DkLogF("StartFrame #%u", n);
+    }
+    n++;
+}
 void GfxRenderingAPIDeko3D::EndFrame() {
     auto& d = gDk;
+    static uint32_t n = 0;
+    if (n < 3 || n % 600 == 0) {
+        DkLogF("EndFrame #%u", n);
+    }
+    n++;
     int slot = d.queue.acquireImage(d.swapchain);
     d.cmdBuf.clear();
     dk::ImageView target{ d.images[slot] };
@@ -106,4 +140,64 @@ ImTextureID GfxRenderingAPIDeko3D::GetTextureById(int) { return 0; }
 void GfxRenderingAPIDeko3D::SetCurrentPrimDepth(float depth) { mCurrentPrimDepth = depth; mPrimDepthDirty = true; }
 } // namespace Fast
 
+extern "C" {
+extern char __start__;
+[[noreturn]] void __real_exit(int code);
+[[noreturn]] void __wrap_exit(int code) {
+    uintptr_t ra = (uintptr_t)__builtin_return_address(0);
+    Fast::DkLogF("exit(%d) called, return address offset=0x%lx", code, (unsigned long)(ra - (uintptr_t)&__start__));
+    __real_exit(code);
+}
+}
+
+extern "C" {
+static void DkLogExit(const char* what, int code, uintptr_t ra) {
+    MemoryInfo mi;
+    u32 pi;
+    uintptr_t base = 0;
+    if (R_SUCCEEDED(svcQueryMemory(&mi, &pi, ra))) {
+        base = (uintptr_t)mi.addr;
+    }
+    Fast::DkLogF("%s(%d) ra=0x%lx offset=0x%lx", what, code, (unsigned long)ra, (unsigned long)(ra - base));
+}
+[[noreturn]] void __real__exit(int code);
+[[noreturn]] void __wrap__exit(int code) {
+    DkLogExit("_exit", code, (uintptr_t)__builtin_return_address(0));
+    __real__exit(code);
+}
+[[noreturn]] void __real___libnx_exit(int code);
+[[noreturn]] void __wrap___libnx_exit(int code) {
+    DkLogExit("__libnx_exit", code, (uintptr_t)__builtin_return_address(0));
+    __real___libnx_exit(code);
+}
+[[noreturn]] void __real_svcExitProcess(void);
+[[noreturn]] void __wrap_svcExitProcess(void) {
+    DkLogExit("svcExitProcess", 0, (uintptr_t)__builtin_return_address(0));
+    __real_svcExitProcess();
+}
+bool __real_appletMainLoop(void);
+bool __wrap_appletMainLoop(void) {
+    bool r = __real_appletMainLoop();
+    if (!r) {
+        DkLogExit("appletMainLoop returned false", 0, (uintptr_t)__builtin_return_address(0));
+    }
+    return r;
+}
+}
+extern "C" {
+[[noreturn]] void __real_abort(void);
+[[noreturn]] void __wrap_abort(void) {
+    DkLogExit("abort", 0, (uintptr_t)__builtin_return_address(0));
+    __real_abort();
+}
+[[noreturn]] void __real___cxa_throw(void*, void*, void (*)(void*));
+[[noreturn]] void __wrap___cxa_throw(void* obj, void* tinfo, void (*dest)(void*)) {
+    static int count = 0;
+    if (count++ < 20) {
+        DkLogExit(tinfo ? static_cast<std::type_info*>(tinfo)->name() : "throw", 0,
+                  (uintptr_t)__builtin_return_address(0));
+    }
+    __real___cxa_throw(obj, tinfo, dest);
+}
+}
 #endif // ENABLE_DEKO3D
