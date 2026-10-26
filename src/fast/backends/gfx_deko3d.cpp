@@ -129,7 +129,13 @@ void GfxRenderingAPIDeko3D::ClearFramebuffer(bool, bool) {}
 void GfxRenderingAPIDeko3D::ReadFramebufferToCPU(int, uint32_t, uint32_t, uint16_t*) {}
 void GfxRenderingAPIDeko3D::ResolveMSAAColorBuffer(int, int) {}
 std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
-GfxRenderingAPIDeko3D::GetPixelDepth(int, const std::set<std::pair<float, float>>&) { return {}; }
+GfxRenderingAPIDeko3D::GetPixelDepth(int, const std::set<std::pair<float, float>>& coordinates) {
+    std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> res;
+    for (const auto& c : coordinates) {
+        res[c] = 0xFFFF; // TODO: read the real depth buffer
+    }
+    return res;
+}
 void* GfxRenderingAPIDeko3D::GetFramebufferTextureId(int) { return nullptr; }
 void GfxRenderingAPIDeko3D::SelectTextureFb(int) {}
 void GfxRenderingAPIDeko3D::DeleteTexture(uint32_t) {}
