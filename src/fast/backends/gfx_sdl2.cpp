@@ -563,6 +563,7 @@ void GfxWindowBackendSDL2::SetMouseCallbacks(bool (*onMouseButtonDown)(int btn),
 }
 
 void GfxWindowBackendSDL2::GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY) {
+    if (!mWnd) { *width = 1280; *height = 720; *posX = 0; *posY = 0; return; }
 #ifdef __APPLE__
     SDL_GetWindowSize(mWnd, static_cast<int*>((void*)width), static_cast<int*>((void*)height));
 #else
