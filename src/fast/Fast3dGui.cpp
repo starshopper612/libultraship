@@ -28,6 +28,10 @@
 #include "ship/port/switch/SwitchImpl.h"
 #endif
 
+#ifdef ENABLE_DEKO3D
+#include "fast/backends/gfx_deko3d.h"
+#endif
+
 #ifdef ENABLE_OPENGL
 #include <imgui_impl_opengl3.h>
 #include <imgui_impl_sdl2.h>
@@ -212,18 +216,9 @@ void Fast3dGui::ImGuiBackendShutdown() {
 void Fast3dGui::ImGuiBackendNewFrame() {
     switch (mImpl.Backend) {
 #ifdef ENABLE_DEKO3D
-        case WindowBackend::FAST3D_SDL_DEKO3D: {
-            // No renderer/platform backend yet: build the font atlas and set the display size ourselves.
-            ImGuiIO& io = ImGui::GetIO();
-            io.DisplaySize = ImVec2(1280.0f, 720.0f);
-            if (!io.Fonts->IsBuilt()) {
-                unsigned char* pixels = nullptr;
-                int w = 0, h = 0;
-                io.Fonts->GetTexDataAsRGBA32(&pixels, &w, &h);
-                io.Fonts->SetTexID((ImTextureID)(uintptr_t)1);
-            }
+        case WindowBackend::FAST3D_SDL_DEKO3D:
+            Fast::GfxDeko3dImGuiNewFrame();
             break;
-        }
 #endif
 #ifdef ENABLE_OPENGL
         case WindowBackend::FAST3D_SDL_OPENGL:
@@ -277,6 +272,11 @@ void Fast3dGui::RefreshImGuiGamepads() {
 
 void Fast3dGui::ImGuiRenderDrawData(ImDrawData* data) {
     switch (mImpl.Backend) {
+#ifdef ENABLE_DEKO3D
+        case WindowBackend::FAST3D_SDL_DEKO3D:
+            Fast::GfxDeko3dImGuiRender(data);
+            break;
+#endif
 #ifdef ENABLE_OPENGL
         case WindowBackend::FAST3D_SDL_OPENGL:
             ImGui_ImplOpenGL3_RenderDrawData(data);
