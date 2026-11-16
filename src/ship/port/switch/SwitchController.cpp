@@ -12,6 +12,42 @@ static constexpr uint64_t CONTROLLER_MASK = 1UL;
 static std::unordered_map<int32_t, int32_t> sInstanceIdToDeviceSlot;
 static std::unordered_map<int32_t, std::string> sInstanceIdToSerial;
 
+// Vibration handles libnx (4.12.0, _hidGetVibrationDeviceHandles) builds per style. Asking for more
+// returns LibnxError_BadInput before anything is activated. 0: no vibration device (Lucia, Lark, Lager).
+static s32 GetVibrationHandleCount(uint64_t style) {
+    switch (style) {
+        case HidNpadStyleTag_NpadFullKey:
+        case HidNpadStyleTag_NpadHandheld:
+        case HidNpadStyleTag_NpadJoyDual:
+            return 2;
+        case HidNpadStyleTag_NpadJoyLeft:
+        case HidNpadStyleTag_NpadJoyRight:
+        case HidNpadStyleTag_NpadGc:
+        case HidNpadStyleTag_NpadLagon:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+// hid cmd 212 SendVibrationValueInBool [11.0.0+]. Unproven on hardware: switchbrew lists it as a stub, but
+// a reverse-engineered HID model routes it to the N64 (Lagon) vibration device and drops cmd 206 values for
+// N64 handles, so Lagon gets both. libnx has no wrapper; the layout matches libnx's bool + u32 + aruid commands.
+static Result SendVibrationValueInBool(HidVibrationDeviceHandle handle, bool on) {
+    if (hosversionBefore(11, 0, 0)) {
+        return MAKERESULT(Module_Libnx, LibnxError_IncompatSysVer);
+    }
+    struct {
+        u8 flag;
+        u8 pad[3];
+        u32 handle;
+        u64 AppletResourceUserId;
+    } in = { static_cast<u8>(on), { 0 }, handle.type_value, appletGetAppletResourceUserId() };
+    SfDispatchParams params = {};
+    params.in_send_pid = true;
+    return serviceDispatchImpl(hidGetServiceSession(), 212, &in, sizeof(in), nullptr, 0, params);
+}
+
 void SwitchController::RegisterDevice(int32_t instanceId, int32_t slot, const std::string& serial) {
     sInstanceIdToDeviceSlot[instanceId] = slot;
     sInstanceIdToSerial[instanceId] = serial;
@@ -91,9 +127,8 @@ bool SwitchController::EnsureInitialized(uint8_t portIndex) {
     padInitializeWithMask(&controller.State, padMask);
     padUpdate(&controller.State);
 
-    Result vibInitResult0 = hidInitializeVibrationDevices(controller.Handles[0], 2, HidNpadIdType_Handheld, HidNpadStyleTag_NpadHandheld);
-    Result vibInitResult1 = hidInitializeVibrationDevices(controller.Handles[1], 2, npadId, HidNpadStyleTag_NpadJoyDual);
-    SPDLOG_INFO("hidInitializeVibrationDevices results: handheld={:#x}, joydual={:#x}", vibInitResult0, vibInitResult1);
+    // Handles[1] is initialised lazily in SendRumble for the external pad's actual style.
+    controller.HandheldRumbleReady = InitVibration(portIndex, 0, HidNpadIdType_Handheld, HidNpadStyleTag_NpadHandheld);
 
     hidGetSixAxisSensorHandles(&controller.Sensors[0], 1, HidNpadIdType_Handheld, HidNpadStyleTag_NpadHandheld);
     hidGetSixAxisSensorHandles(&controller.Sensors[1], 1, npadId, HidNpadStyleTag_NpadFullKey);
@@ -117,6 +152,36 @@ bool SwitchController::EnsureInitialized(uint8_t portIndex) {
 
     controller.Initialized = true;
     return true;
+}
+
+bool SwitchController::InitVibration(uint8_t portIndex, int slot, HidNpadIdType npadId, uint64_t style) {
+    auto& controller = mControllers[portIndex];
+    const s32 count = GetVibrationHandleCount(style);
+    Result rc = MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    if (count > 0) {
+        rc =
+            hidInitializeVibrationDevices(controller.Handles[slot], count, npadId, static_cast<HidNpadStyleTag>(style));
+    }
+
+    // A failed init is retried on every call, so log each distinct failure once.
+    const uint64_t failKey = (style << 32) | rc;
+    if (R_SUCCEEDED(rc) || controller.LastInitFailLog[slot] != failKey) {
+        SPDLOG_INFO("Rumble init: port={} slot={} npadId={} style={:#x} handles={}{} result={:#x} deviceType={:#x}",
+                    portIndex, slot, static_cast<int>(npadId), style, count, count == 0 ? " (no vibration device)" : "",
+                    rc, hidGetNpadDeviceType(npadId));
+    }
+    controller.LastInitFailLog[slot] = R_SUCCEEDED(rc) ? ~0ULL : failKey;
+    for (s32 i = 0; R_SUCCEEDED(rc) && i < count; i++) {
+        HidVibrationDeviceInfo info = {};
+        bool mounted = false;
+        const Result infoRc = hidGetVibrationDeviceInfo(controller.Handles[slot][i], &info);
+        const Result mountRc = hidIsVibrationDeviceMounted(controller.Handles[slot][i], &mounted);
+        SPDLOG_INFO("Rumble device: port={} slot={} handle[{}]={:#x} type={} position={} infoResult={:#x} "
+                    "mounted={} mountResult={:#x}",
+                    portIndex, slot, i, controller.Handles[slot][i].type_value, info.type, info.position, infoRc,
+                    mounted, mountRc);
+    }
+    return R_SUCCEEDED(rc);
 }
 
 static void ApplyRightJoyConOrientation(HidSixAxisSensorState& state) {
@@ -282,9 +347,7 @@ bool SwitchController::IsDetachableJoyConPair(uint8_t portIndex) {
 }
 
 void SwitchController::SendRumble(uint8_t portIndex, float lowFrequencyAmplitude, float highFrequencyAmplitude) {
-    SPDLOG_INFO("SendRumble called: portIndex={}, low={}, high={}", portIndex, lowFrequencyAmplitude, highFrequencyAmplitude);
     if (!EnsureInitialized(portIndex)) {
-        SPDLOG_INFO("SendRumble: EnsureInitialized failed for port {}", portIndex);
         return;
     }
 
@@ -307,34 +370,76 @@ void SwitchController::SendRumble(uint8_t portIndex, float lowFrequencyAmplitude
         externalStyle = HidNpadStyleTag_NpadLark;
     } else if (styleSet & HidNpadStyleTag_NpadLager) {
         externalStyle = HidNpadStyleTag_NpadLager;
+    } else if (styleSet & HidNpadStyleTag_NpadJoyLeft) {
+        externalStyle = HidNpadStyleTag_NpadJoyLeft;
+    } else if (styleSet & HidNpadStyleTag_NpadJoyRight) {
+        externalStyle = HidNpadStyleTag_NpadJoyRight;
     }
 
+    // Latch a style only once its init succeeded, so a failed init is retried rather than sending to
+    // unactivated or stale handles.
     if (externalStyle != 0 && controller.LastExternalRumbleStyle != externalStyle) {
-        Result reinitResult = hidInitializeVibrationDevices(controller.Handles[1], 2, GetNpadId(portIndex),
-                                      static_cast<HidNpadStyleTag>(externalStyle));
-        SPDLOG_INFO("RUMBLE_CALIB reinit externalStyle={:#x} reinitResult={:#x} deviceType={:#x}",
-                    externalStyle, reinitResult, hidGetNpadDeviceType(GetNpadId(portIndex)));
-        controller.LastExternalRumbleStyle = externalStyle;
+        controller.LastExternalRumbleStyle =
+            InitVibration(portIndex, 1, GetNpadId(portIndex), externalStyle) ? externalStyle : 0;
+    }
+    const bool externalReady = externalStyle != 0 && controller.LastExternalRumbleStyle == externalStyle;
+    const bool handheld = padIsHandheld(&controller.State);
+    if (externalStyle == 0 && handheld && !controller.HandheldRumbleReady) {
+        controller.HandheldRumbleReady =
+            InitVibration(portIndex, 0, HidNpadIdType_Handheld, HidNpadStyleTag_NpadHandheld);
     }
 
+    const float ampLow = std::clamp(lowFrequencyAmplitude, 0.0f, 1.0f);
+    const float ampHigh = std::clamp(highFrequencyAmplitude, 0.0f, 1.0f);
+    const bool on = ampLow > 0.0f || ampHigh > 0.0f;
     HidVibrationValue vibrationValues[2] = {};
     for (auto& value : vibrationValues) {
-        value.amp_low = std::clamp(lowFrequencyAmplitude, 0.0f, 1.0f);
-        value.amp_high = std::clamp(highFrequencyAmplitude, 0.0f, 1.0f);
+        value.amp_low = ampLow;
+        value.amp_high = ampHigh;
         value.freq_low = 160.0f;
         value.freq_high = 320.0f;
     }
 
-    SPDLOG_INFO("SendRumble: styleSet={:#x}, externalStyle={:#x}, isHandheld={}", styleSet, externalStyle, padIsHandheld(&controller.State));
-    Result sendResult = 0;
-    if (externalStyle != 0) {
-        sendResult = hidSendVibrationValues(controller.Handles[1], vibrationValues, 2);
-        SPDLOG_INFO("SendRumble: sent via Handles[1] (external), result={:#x}", sendResult);
-    } else if (padIsHandheld(&controller.State)) {
-        sendResult = hidSendVibrationValues(controller.Handles[0], vibrationValues, 2);
-        SPDLOG_INFO("SendRumble: sent via Handles[0] (handheld), result={:#x}", sendResult);
-    } else {
-        SPDLOG_INFO("SendRumble: NO PATH TAKEN - neither handheld nor externalStyle set");
+    // padMask also reads the handheld npad, so an external pad on this port always wins over attached Joy-Cons,
+    // even when it has no motor or its init failed (then nothing rumbles and the log says why).
+    static constexpr const char* kPathNames[] = { "none", "external", "gc-erm", "lagon", "handheld" };
+    int path = 0;
+    Result results[2] = {};
+    if (externalReady) {
+        auto* handles = controller.Handles[1];
+        if (externalStyle == HidNpadStyleTag_NpadGc) {
+            path = 2;
+            results[0] = hidSendVibrationGcErmCommand(handles[0], on ? HidVibrationGcErmCommand_Start
+                                                                     : HidVibrationGcErmCommand_Stop);
+        } else {
+            path = externalStyle == HidNpadStyleTag_NpadLagon ? 3 : 1;
+            results[0] = hidSendVibrationValues(handles, vibrationValues, GetVibrationHandleCount(externalStyle));
+            if (path == 3) {
+                results[1] = SendVibrationValueInBool(handles[0], on);
+            }
+        }
+    } else if (externalStyle == 0 && handheld && controller.HandheldRumbleReady) {
+        path = 4;
+        results[0] = hidSendVibrationValues(controller.Handles[0], vibrationValues, 2);
+    }
+
+    // Runs every tick, and games pulse `on` frame by frame to set strength: log a change of path or result,
+    // and the first `on` after a logged `off`. Lines without a path change are capped in case a result flips
+    // every frame.
+    const bool pathChanged = path != controller.LastSendPath;
+    if ((pathChanged || (on && !controller.LastSendOn) || results[0] != controller.LastSendResult[0] ||
+         results[1] != controller.LastSendResult[1]) &&
+        (pathChanged || controller.SendLogCount < 200)) {
+        SPDLOG_INFO("Rumble send: port={} path={} styleSet={:#x} externalStyle={:#x} handheld={} on={} "
+                    "sendResult={:#x} boolResult={:#x}",
+                    portIndex, kPathNames[path], styleSet, externalStyle, handheld, on, results[0], results[1]);
+        controller.LastSendPath = path;
+        controller.LastSendOn = on;
+        controller.LastSendResult[0] = results[0];
+        controller.LastSendResult[1] = results[1];
+        if (!pathChanged && ++controller.SendLogCount == 200) {
+            SPDLOG_INFO("Rumble send: log limit reached for port {}; only path changes are logged now", portIndex);
+        }
     }
 }
 
